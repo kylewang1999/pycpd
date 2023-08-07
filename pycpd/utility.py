@@ -1,4 +1,4 @@
-import numpy as np
+import numpy as np, torch
 
 
 def is_positive_semi_definite(R):
@@ -7,13 +7,12 @@ def is_positive_semi_definite(R):
             Expected a numpy array, instead got : {}'.format(R))
     return np.all(np.linalg.eigvals(R) > 0)
 
-def gaussian_kernel(X, beta, Y=None):
+def gaussian_kernel(X, beta, Y=None, use_torch=False):
     if Y is None:
         Y = X
-    diff = X[:, None, :] - Y[None, :,  :]
-    diff = np.square(diff)
-    diff = np.sum(diff, 2)
-    return np.exp(-diff / (2 * beta**2))
+    diff = (X[:, None, :] - Y[None, :,  :]) ** 2
+    diff = diff.sum(dim=2) if use_torch else np.sum(diff, 2)
+    return torch.exp(-diff / (2 * beta**2)) if use_torch else np.exp(-diff / (2 * beta**2))
 
 def low_rank_eigen(G, num_eig):
     """

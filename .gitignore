@@ -1,3 +1,4 @@
+deformable_registration_tmp.py
 *.pyc
 /dist/
 /build/

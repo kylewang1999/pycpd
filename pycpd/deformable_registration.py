@@ -52,8 +52,14 @@ class DeformableRegistration(EMRegistration):
 
         """
         if self.low_rank is False:
-            A = np.dot(np.diag(self.P1), self.G) + \
-                self.alpha * self.sigma2 * np.eye(self.M)
+            if isinstance(self.sigma2, numbers.Number):
+                A = np.dot(np.diag(self.P1), self.G) + \
+                    self.alpha * self.sigma2 * np.eye(self.M) 
+            
+            else: # FIXME: What causes A to be only rank 15 (when sigma update rule is modified)
+                A = np.dot(np.diag(self.P1), self.G) + \
+                    self.alpha * np.diag(self.sigma2)
+                
             B = self.PX - np.dot(np.diag(self.P1), self.Y)
             self.W = np.linalg.solve(A, B)
 
@@ -108,25 +114,35 @@ class DeformableRegistration(EMRegistration):
         """
         qprev = self.sigma2
 
-        # The original CPD paper does not explicitly calculate the objective functional.
-        # This functional will include terms from both the negative log-likelihood and
-        # the Gaussian kernel used for regularization.
-        self.q = np.inf
+        if isinstance(self.sigma2, numbers.Number):
+            # The original CPD paper does not explicitly calculate the objective functional.
+            # This functional will include terms from both the negative log-likelihood and
+            # the Gaussian kernel used for regularization.
+            self.q = np.inf
 
-        xPx = np.dot(np.transpose(self.Pt1), np.sum(
-            np.multiply(self.X, self.X), axis=1))
-        yPy = np.dot(np.transpose(self.P1),  np.sum(
-            np.multiply(self.TY, self.TY), axis=1))
-        trPXY = np.sum(np.multiply(self.TY, self.PX))
+            xPx = np.dot(np.transpose(self.Pt1), np.sum(
+                np.multiply(self.X, self.X), axis=1))
+            yPy = np.dot(np.transpose(self.P1),  np.sum(
+                np.multiply(self.TY, self.TY), axis=1))
+            trPXY = np.sum(np.multiply(self.TY, self.PX))
 
-        self.sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
+            self.sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
 
-        if self.sigma2 <= 0:
-            self.sigma2 = self.tolerance / 10
+            if self.sigma2 <= 0:
+                self.sigma2 = self.tolerance / 10
 
-        # Here we use the difference between the current and previous
-        # estimate of the variance as a proxy to test for convergence.
-        self.diff = np.abs(self.sigma2 - qprev)
+            # Here we use the difference between the current and previous
+            # estimate of the variance as a proxy to test for convergence.
+            self.diff = np.abs(np.mean(self.sigma2) - qprev)
+        
+        else:
+            diff2 = np.linalg.norm(self.X[:,None,:]- self.TY,axis=-1)**2  # (N,1,3) - (M,3) -> (N,M) FIXME:
+            weighted_diff2 = self.P.T * diff2
+            denom = np.sum(self.P.T, axis=-1)[:,None]
+            sigma2_ = np.sum(weighted_diff2 / denom, axis=0) / self.D
+            self.sigma2 = sigma2_ / self.D
+            
+            self.diff = np.abs(np.mean(self.sigma2 - qprev))
 
     def get_registration_parameters(self):
         """
