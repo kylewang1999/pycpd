@@ -253,7 +253,7 @@ class EMRegistration(object):
             P = np.exp(-P/(2*self.sigma2))
             c = (2*np.pi*self.sigma2)**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
         else:
-            P = np.exp(-P/(2*self.sigma2[:,None]))
+            P = np.exp(-P/(2*self.sigma2[:, None]))
             c = (2*np.pi*np.mean(self.sigma2))**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
 
         den = np.sum(P, axis = 0, keepdims = True) # (1, N)

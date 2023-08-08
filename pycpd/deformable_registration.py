@@ -36,7 +36,7 @@ class DeformableRegistration(EMRegistration):
         self.alpha = 2 if alpha is None else alpha
         self.beta = 2 if beta is None else beta
         self.W = np.zeros((self.M, self.D))
-        self.G = gaussian_kernel(self.Y, self.beta) # FIXME: Why is G only rank-15?
+        self.G = gaussian_kernel(self.Y, self.beta)
         self.low_rank = low_rank
         self.num_eig = num_eig
         if self.low_rank is True:
@@ -81,7 +81,7 @@ class DeformableRegistration(EMRegistration):
             P = np.exp(-P/(2*self.sigma2))
             c = (2*np.pi*self.sigma2)**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
         else:
-            P = np.exp(-P/(2*self.sigma2[:,None]))
+            P = np.exp(-P/(2*self.sigma2[:, None]))
             c = (2*np.pi*np.mean(self.sigma2))**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
 
         den = np.sum(P, axis = 0, keepdims = True) # (1, N)
@@ -107,11 +107,9 @@ class DeformableRegistration(EMRegistration):
                 A = np.dot(np.diag(self.P1), self.G) + \
                     self.alpha * self.sigma2 * np.eye(self.M) 
             else: 
-                A =  np.diag(self.P1) @ self.G + \
-                    self.alpha * np.diag(self.sigma2)       # This worked (but it was the wrong derivation)
-                # A =  self.G @ np.diag(self.P1) + \
-                #     self.alpha * np.diag(self.sigma2)     # This didn't work (but was the right derivation)
-                
+                A =  self.G @ np.diag(self.P1) + \
+                    self.alpha * np.diag(self.sigma2)     
+
             B = self.PX - (np.diag(self.P1) @ self.Y)
             self.W = np.linalg.solve(A, B)
             # self.W = np.linalg.pinv(A) @ B
@@ -188,10 +186,20 @@ class DeformableRegistration(EMRegistration):
         
         # Assume each \sigma_m^2 is different
         else:   
-            diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1)**2  # (M,1,3) - (N,3) -> (M,N)
+            ''' Shan's Method '''
+            diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
             weighted_diff2 = self.P * diff2             # (M,N)
             denom = np.sum(self.P, axis=1)[:,None]      # (M,1)
-            self.sigma2 = np.sum(weighted_diff2 / denom, axis=1) / self.D
+            self.sigma2 = np.mean(weighted_diff2 / denom, axis=1) / self.D
+
+            ''' My Method '''
+            # diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
+            # self.sigma2 = np.mean(diff2, axis=1) / self.D
+
+            # diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1)**2  # (M,1,3) - (N,3) -> (M,N)
+            # weighted_diff2 = self.P * diff2             # (M,N)
+            # denom = np.sum(self.P, axis=0)[None,:]      # (1,N)
+            # self.sigma2 = np.mean(weighted_diff2 / denom, axis=1) / self.D
 
         # Here we use the difference between the current and previous
         # estimate of the variance as a proxy to test for convergence.    
