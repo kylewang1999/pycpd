@@ -107,8 +107,10 @@ class DeformableRegistration(EMRegistration):
                 A = np.dot(np.diag(self.P1), self.G) + \
                     self.alpha * self.sigma2 * np.eye(self.M) 
             else: 
-                A =  self.G @ np.diag(self.P1) + \
-                    self.alpha * np.diag(self.sigma2)     
+                # A =  self.G @ np.diag(self.P1) + \
+                #     self.alpha * np.diag(self.sigma2)     # Correct derivation, but cause large sigma2
+                A = np.dot(np.diag(self.P1), self.G) + \
+                    self.alpha * np.diag(self.sigma2)
 
             B = self.PX - (np.diag(self.P1) @ self.Y)
             self.W = np.linalg.solve(A, B)
@@ -190,7 +192,7 @@ class DeformableRegistration(EMRegistration):
             diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
             weighted_diff2 = self.P * diff2             # (M,N)
             denom = np.sum(self.P, axis=1)[:,None]      # (M,1)
-            self.sigma2 = np.mean(weighted_diff2 / denom, axis=1) / self.D
+            self.sigma2 = np.sum(weighted_diff2 / denom, axis=1) / self.D
 
             ''' My Method '''
             # diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
