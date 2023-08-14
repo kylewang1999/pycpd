@@ -23,18 +23,13 @@ class DeformableRegistration(EMRegistration):
         Number of eigenvectors to use in lowrank calculation.
     """
 
-    def __init__(self, alpha=None, beta=None, low_rank=False, num_eig=100, *args, **kwargs):
+    def __init__(self, alpha=2, beta=2, low_rank=False, num_eig=100,*args, **kwargs):
         super().__init__(*args, **kwargs)
-        if alpha is not None and (not isinstance(alpha, numbers.Number) or alpha <= 0):
-            raise ValueError(
-                "Expected a positive value for regularization parameter alpha. Instead got: {}".format(alpha))
+        assert alpha > 0, "alpha must be positive"
+        assert beta > 0, "beta must be positive"
 
-        if beta is not None and (not isinstance(beta, numbers.Number) or beta <= 0):
-            raise ValueError(
-                "Expected a positive value for the width of the coherent Gaussian kerenl. Instead got: {}".format(beta))
-
-        self.alpha = 2 if alpha is None else alpha
-        self.beta = 2 if beta is None else beta
+        self.alpha = alpha
+        self.beta = beta
         self.W = np.zeros((self.M, self.D))
         self.G = gaussian_kernel(self.Y, self.beta)
         self.low_rank = low_rank
@@ -64,7 +59,7 @@ class DeformableRegistration(EMRegistration):
             Returned params dependent on registration method used. 
         """
         self.transform_point_cloud()
-        while self.iteration < self.max_iterations and self.diff > self.tolerance:
+        while self.iteration < self.max_iterations and self.diff > self.tolerance and self.diff<=self.diff_bound:
             self.iterate()
             if callable(callback):
                 kwargs = {'iteration': self.iteration,
@@ -96,7 +91,7 @@ class DeformableRegistration(EMRegistration):
     def maximization(self):
         self.update_transform()
         self.transform_point_cloud()
-        self.update_variance()
+        # self.update_variance()    # FIXME: Incorporate this step after debugging update_transform()
 
     def update_transform(self):
         """ Calculate a new estimate of the deformable transformation.
@@ -106,16 +101,23 @@ class DeformableRegistration(EMRegistration):
             if isinstance(self.sigma2, numbers.Number):
                 A = np.dot(np.diag(self.P1), self.G) + \
                     self.alpha * self.sigma2 * np.eye(self.M) 
-            else: 
+                B = self.PX - (np.diag(self.P1) @ self.Y)
+            else: # FIXME: The derivation of A is still wrong.
+                # self.sigma2 = np.ones(self.M) * np.mean(self.sigma2)
+                
                 # A =  self.G @ np.diag(self.P1) + \
-                #     self.alpha * np.diag(self.sigma2)     # Correct derivation, but cause large sigma2
-                A = np.dot(np.diag(self.P1), self.G) + \
-                    self.alpha * np.diag(self.sigma2)
+                    # self.alpha * np.diag(self.sigma2)    # Correct derivation, but cause large sigma2
+                # B = self.PX - (np.diag(self.P1) @ self.Y)
+                # A = np.diag(self.P1) @ self.G + \
+                    # self.alpha * np.diag(self.sigma2)       # Good behaving sigma2, but derivation is wrong
 
-            B = self.PX - (np.diag(self.P1) @ self.Y)
-            self.W = np.linalg.solve(A, B)
-            # self.W = np.linalg.pinv(A) @ B
-            self.A, self.B = A,B
+                ''' No d(P1) inv multiplied, straight up'''
+                dP1_inv = np.linalg.pinv(np.diag(self.P1))
+                A = self.G + self.alpha * (dP1_inv @ np.diag(self.sigma2))
+                B = dP1_inv @ self.PX - self.Y
+            
+            # self.W = np.linalg.solve(A, B)
+            self.W = np.linalg.pinv(A) @ B
             
 
         elif self.low_rank is True:
@@ -181,31 +183,22 @@ class DeformableRegistration(EMRegistration):
                 np.multiply(self.TY, self.TY), axis=1))
             trPXY = np.sum(np.multiply(self.TY, self.PX))
 
-            self.sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
-
-            if self.sigma2 <= 0:
-                self.sigma2 = self.tolerance / 10
+            sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
+            if sigma2 <= 0: sigma2 = self.tolerance / 10
         
         # Assume each \sigma_m^2 is different
         else:   
-            ''' Shan's Method '''
             diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
             weighted_diff2 = self.P * diff2             # (M,N)
             denom = np.sum(self.P, axis=1)[:,None]      # (M,1)
-            self.sigma2 = np.sum(weighted_diff2 / denom, axis=1) / self.D
-
-            ''' My Method '''
-            # diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N)
-            # self.sigma2 = np.mean(diff2, axis=1) / self.D
-
-            # diff2 = np.linalg.norm(self.TY[:,None,:] - self.X, axis=-1)**2  # (M,1,3) - (N,3) -> (M,N)
-            # weighted_diff2 = self.P * diff2             # (M,N)
-            # denom = np.sum(self.P, axis=0)[None,:]      # (1,N)
-            # self.sigma2 = np.mean(weighted_diff2 / denom, axis=1) / self.D
+            sigma2 = np.sum(weighted_diff2 / denom, axis=1) / self.D
 
         # Here we use the difference between the current and previous
         # estimate of the variance as a proxy to test for convergence.    
-        self.diff = np.mean(np.abs(self.sigma2 - qprev))
+        self.diff = np.mean(np.abs(sigma2 - qprev))
+        if self.diff <= self.diff_bound: 
+            self.sigma2 = sigma2
+            self.updated_variance = True
 
     def get_registration_parameters(self):
         """

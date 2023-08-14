@@ -132,7 +132,7 @@ class EMRegistration(object):
 
     """
 
-    def __init__(self, X, Y, sigma2=None, max_iterations=None, tolerance=None, w=None, *args, **kwargs):
+    def __init__(self, X, Y, diff_bound=5e-6, sigma2=None, max_iterations=None, tolerance=1e-6, w=None, *args, **kwargs):
         if len(X.shape)!=2:
             raise ValueError(
                 "The target point cloud (X) must be at a 2D numpy array.")
@@ -166,11 +166,12 @@ class EMRegistration(object):
         self.sigma2 = initialize_sigma2(X, Y) if sigma2 is None else sigma2
         (self.N, self.D) = self.X.shape
         (self.M, _) = self.Y.shape
-        self.tolerance = 0.001 if tolerance is None else tolerance
+        self.tolerance = tolerance
         self.w = 0.0 if w is None else w
         self.max_iterations = 100 if max_iterations is None else max_iterations
         self.iteration = 0
-        self.diff = np.inf
+        self.diff_bound = diff_bound
+        self.diff = self.diff_bound
         self.q = np.inf
         self.P = np.zeros((self.M, self.N))
         self.Pt1 = np.zeros((self.N, ))

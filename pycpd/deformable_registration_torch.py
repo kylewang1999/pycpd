@@ -1,7 +1,11 @@
 from __future__ import division
-import numbers, torch, numpy as np
-from warnings import warn
+from math import log
+import numbers, numpy as np
+import torch, torch.nn as nn
 from pycpd.utility import *
+from tqdm import tqdm
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def compute_sigma2(X, Y, P=None):
     """ Compute the variance (sigma2).
@@ -16,77 +20,131 @@ def compute_sigma2(X, Y, P=None):
     """
     (N, D) = X.shape
     (M, _) = Y.shape
-    if P is None: P = torch.ones(M,N).cuda()
 
-    diff2 = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2  # (M,1,3) - (N,3) -> (M,N,3) -> (M,N)
-    weighted_diff2 = P * diff2      # (M,N)
-    denom = P.sum(dim=-1)[:,None]  # (M,1)
-    sigma2 = torch.sum(weighted_diff2 / denom, dim=-1) / D  # (M, N) -> (M,)
+    if isinstance(X, torch.Tensor):
+        if P is None: P = torch.ones((M,N), device=DEVICE)
+        diff2 = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2  # (M,1,3) - (N,3) -> (M,N,3) -> (M,N)
+        weighted_diff2 = P * diff2      # (M,N)
+        denom = P.sum(dim=-1)[:,None]  # (M,1)
+        sigma2 = torch.sum(weighted_diff2 / denom, dim=-1) / D  # (M, N) -> (M,)
+        return sigma2
+    
+    else:
+        if P is None: P = np.ones((M,N), dtype=np.float64)
+        diff2 = np.linalg.norm(Y[:,None,:] - X, axis=-1, ord=2)**2  # (M,1,3) - (N,3) -> (M,N,3) -> (M,N)
+        weighted_diff2 = P * diff2      # (M,N)
+        denom = np.sum(P, axis=-1)[:,None]  # (M,1)
+        sigma2 = np.sum(weighted_diff2 / denom, axis=-1) / D  # (M, N) -> (M,)
+        return sigma2
 
-    return sigma2
+def np2torch(X, dtype=torch.float64): 
+    return torch.as_tensor(X, dtype=dtype, device=DEVICE) if isinstance(X, np.ndarray) else X
 
+def torch2np(X):  
+    return X.cpu().detach().numpy().squeeze() if isinstance(X, torch.Tensor) else X
 
+class DeformableRegistrationLoss(nn.Module):
+    def __init__(self):
+        super(DeformableRegistrationLoss, self).__init__()
+
+    def forward(self, X, Y, sigma2, P, G, W, alpha=1, beta=2):
+        '''
+        Inputs:
+            - X: (N,D=3).       Target point cloud 
+            - Y: (M,D).         Source gmm centroids
+            - sigma2: (M,).     Variance of each gmm centroid
+            - P: (M,N).         Soft cluster assignments
+            - G: (M,M).         Y after gaussian kernel
+            - W: (M,D).         Deformable transformation  \delta Y  = G @ W
+            - alpha: (scalar).  Regularization strength of CPD term
+            - beta: (scalar).   Regularization strength of other terms
+        '''
+        (N,D) = X.shape; (M,_) = Y.shape
+
+        log_term = torch.log(sigma2)[:,None]                    # (M,1)
+        diff_term = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2 # (M,N)
+        diff_term /= sigma2[:,None]                             # (M,N)
+        
+        gmm_loss = D * log_term + diff_term                     # (M,N)
+        gmm_loss = torch.sum(P * gmm_loss)               
+        
+        cpd_loss = torch.trace(W.T @ G @ W)                      
+
+        loss = gmm_loss + alpha * cpd_loss
+        return loss
+    
 class DeformableRegistrationTorch(object):
 
-    def __init__(self, X, Y, P=None, sigma2=None, max_iterations=None, tolerance=None, 
-        alpha=2, beta=2, w=None, *args, **kwargs):
+    def __init__(self, X, Y, P=None, sigma2=None, max_iterations=100, tolerance=1e-3, 
+        alpha=2, beta=2, w=0.0, solver='em', optim_config=None, *args, **kwargs):
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.X = X
-        self.Y = Y
-        self.TY = Y
-        self.sigma2 = compute_sigma2(X, Y, P) if sigma2 is None else sigma2
-        (self.N, self.D) = self.X.shape
-        (self.M, _) = self.Y.shape
-        self.tolerance = 0.001 if tolerance is None else tolerance
-        self.w = 0.0 if w is None else w
-        self.max_iterations = 100 if max_iterations is None else max_iterations
-        self.iteration = 0
-        self.diff = torch.inf
-        self.q = torch.inf
-        self.P = torch.zeros((self.M, self.N), device=self.device) if P is None else P
-        self.Pt1 = torch.zeros((self.N, ), device=self.device)
-        self.P1 = torch.zeros((self.M, ), device=self.device)
-        self.PX = torch.zeros((self.M, self.D), device=self.device)
-        self.Np = 0
+        assert solver in ['em', 'torch'], f'Solver {solver} not supported. Expect \'em\' for Expectation-Maximization or \'torch\' for PyTorch autograd'
+        self.solver = solver
+        self.optim_config = {
+            'W': {'lr': 5e-5, 'epochs': 10000},
+            'P': {'lr': 1e-4, 'epochs': 1000},
+            'sigma2': {'lr': 1e-6, 'epochs': 1}
+        } if optim_config is None else optim_config
 
-        self.alpha = alpha; self.beta = beta
-        self.W = torch.zeros((self.M, self.D), device=self.device)
-        self.G = gaussian_kernel(self.Y, self.beta) # FIXME: Why is G only rank-15?
+        self.device = DEVICE; 
+        self.X = np2torch(X); self.Y = np2torch(Y); self.TY = np2torch(Y)
+        self.alpha = alpha; self.beta = beta; self.w = w
+        (self.N, self.D) = X.shape; (self.M, _) = Y.shape
+        self.max_iterations = max_iterations; self.tolerance = tolerance
         
-        
+        self.G = gaussian_kernel(self.Y, self.beta)
+        self.Np = 0; self.iteration = 0
+
+        self.diff = torch.inf; self.q = torch.inf
+        if sigma2 is None: sigma2 = compute_sigma2(self.X, self.Y, self.P)
+        if not isinstance(sigma2, torch.Tensor): self.sigma2 = np2torch(sigma2)
+        self.P = torch.ones((self.M, self.N), device=self.device, requires_grad=False, dtype=torch.float64) if P is None else P
+        self.Pt1 = torch.zeros((self.N, ), device=self.device, dtype=torch.float64, requires_grad=False)
+        self.P1 = torch.zeros((self.M, ), device=self.device, dtype=torch.float64, requires_grad=False)
+        self.PX = torch.zeros((self.M, self.D), device=self.device, dtype=torch.float64, requires_grad=False)
+        self.W = torch.zeros((self.M, self.D), device=self.device, dtype=torch.float64, requires_grad=False)
+
+        self.loss = DeformableRegistrationLoss()
+    
+    def init_state(self, iterations=3):
+        ''' Used by torch solver only. Initialize P and W by running a few iterations of EM. '''
+        for _ in range(iterations):
+            self.expectation()
+            self.maximization()
+
     def register(self, callback=lambda **kwargs: None):
+        if self.solver == 'torch': self.init_state()
+
         self.transform_point_cloud()
         while self.iteration < self.max_iterations and self.diff > self.tolerance:
             self.iterate()
             if callable(callback):
-                kwargs = {'iteration': self.iteration,
-                          'error': self.q, 'X': self.X, 'Y': self.TY}
+                kwargs = {'iteration': self.iteration, 'error': self.q, 'X': self.X, 'Y': self.TY}
                 callback(**kwargs)
-
         return self.TY, self.get_registration_parameters()
 
-
     def iterate(self):
-        """
-        Perform one iteration of the EM algorithm.
-        """
-        self.expectation()
-        self.maximization()
+        if self.solver == 'em': 
+            self.expectation()
+            self.maximization()
+        
+        else:                
+            self.expectation()
+            self.optimize_W()
+            self.transform_point_cloud()
+            # self.optimize_sigma2()
+        
         self.iteration += 1
 
     def expectation(self):
-        """
-        Compute the expectation step of the EM algorithm.
-        """
-        P = torch.sum((self.X[None, :, :] - self.TY[:, None, :])**2, axis=2) # (M, N)
         c = 0
+        P = torch.sum((self.X[None, :, :] - self.TY[:, None, :])**2, dim=2) # (M, N)
         
         if isinstance(self.sigma2, numbers.Number):
             P = torch.exp(-P/(2*self.sigma2))
             c = (2*torch.pi*self.sigma2)**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
         else:
-            P = torch.exp(-P/(2*self.sigma2[:,None]))
+            P = torch.exp(-P/(2*self.sigma2[:, None]))
             c = (2*torch.pi*torch.mean(self.sigma2))**(self.D/2)*self.w/(1. - self.w)*self.M/self.N
 
         den = torch.sum(P, axis = 0, keepdims = True) # (1, N)
@@ -99,97 +157,115 @@ class DeformableRegistrationTorch(object):
         self.PX = torch.matmul(self.P, self.X)
 
     def maximization(self):
-        """
-        Compute the maximization step of the EM algorithm.
-        """
         self.update_transform()
         self.transform_point_cloud()
-        self.update_variance()
+        # self.update_variance()    # FIXME: Incorporate this step after debugging update_transform()
 
     def update_transform(self):
-        """
-        Calculate a new estimate of the deformable transformation.
-        See Eq. 22 of https://arxiv.org/pdf/0905.2635.pdf.
-
-        """
-        if isinstance(self.sigma2, numbers.Number) or self.sigma2.shape[0]==1:
-            A = torch.diag(self.P1) @ self.G + \
-                self.alpha * self.sigma2 * torch.eye(self.M) 
+        """ Calculate a new estimate of the deformable transformation.See Eq. 22 of https://arxiv.org/pdf/0905.2635.pdf."""
         
-        else: 
+        if isinstance(self.sigma2, numbers.Number):
             A = torch.diag(self.P1) @ self.G + \
-                self.alpha * torch.diag(self.sigma2)
-            
-        B = self.PX - (torch.diag(self.P1) @ self.Y)
+                self.alpha * self.sigma2 * torch.eye(self.M, device=self.device)
+            B = self.PX - torch.diag(self.P1) @ self.Y
 
+        else:
+            dP1_inv = torch.pinverse(torch.diag(self.P1))
+            A = self.G + self.alpha * (dP1_inv @ torch.diag(self.sigma2))
+            B = dP1_inv @ self.PX - self.Y
+        
         self.W = torch.pinverse(A) @ B
-
- 
+            
     def transform_point_cloud(self, Y=None):
         if Y is not None:
             G = gaussian_kernel(X=Y, beta=self.beta, Y=self.Y)
-            return Y + (G @ self.W)
+            return Y + G @ self.W
         else:
-            self.TY = self.Y + (self.G @ self.W)
-
+            self.TY = self.Y + self.G @ self.W
 
     def update_variance(self):
-        """
-        Update the variance of the mixture model using the new estimate of the deformable transformation.
-        See the update rule for sigma2 in Eq. 23 of of https://arxiv.org/pdf/0905.2635.pdf.
-
-        """
         qprev = self.sigma2
 
-        # Assume all \sigma_m^2 are the same
         if isinstance(self.sigma2, numbers.Number): 
-            # The original CPD paper does not explicitly calculate the objective functional.
-            # This functional will include terms from both the negative log-likelihood and
-            # the Gaussian kernel used for regularization.
             self.q = torch.inf
 
-            xPx = (self.Pt1.T) @ torch.sum(
-                torch.multiply(self.X, self.X), axis=1)
-            yPy = (self.P1.T) @ torch.sum(
-                torch.multiply(self.TY, self.TY), axis=1)
+            xPx = torch.dot(torch.transpose(self.Pt1), torch.sum(
+                torch.multiply(self.X, self.X), axis=1))
+            yPy = torch.dot(torch.transpose(self.P1),  torch.sum(
+                torch.multiply(self.TY, self.TY), axis=1))
             trPXY = torch.sum(torch.multiply(self.TY, self.PX))
 
-            self.sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
-
-            if self.sigma2 <= 0:
-                self.sigma2 = self.tolerance / 10
+            sigma2 = (xPx - 2 * trPXY + yPy) / (self.Np * self.D)
+            if sigma2 <= 0: sigma2 = self.tolerance / 10
         
-        # Assume each \sigma_m^2 is different
         else:   
-            self.sigma2 = compute_sigma2(self.X, self.Y, self.P)
+            diff2 = torch.norm(self.TY[:,None,:] - self.X, dim=-1, p=2)**2  # (M,1,3) - (N,3) -> (M,N)
+            weighted_diff2 = self.P * diff2             # (M,N)
+            denom = torch.sum(self.P, axis=1)[:,None]      # (M,1)
+            sigma2 = torch.sum(weighted_diff2 / denom, axis=1) / self.D
 
         # Here we use the difference between the current and previous
         # estimate of the variance as a proxy to test for convergence.    
-        self.diff = torch.mean(torch.abs(self.sigma2 - qprev))
+        self.diff = torch.mean(torch.abs(sigma2 - qprev))
+        if True or self.diff <= self.diff_bound: 
+            self.sigma2 = sigma2
+            self.updated_variance = True
 
     def get_registration_parameters(self): return self.G, self.W
 
+    def optimize_P(self):
+        ''' Solve for P using auto grad on self.loss '''
+        
+        self.P.requires_grad = True
+        
+        lr = self.optim_config['P']['lr']; epochs = self.optim_config['P']['epochs']
+        optimizer = torch.optim.Adam([self.P], lr=lr)
+        for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing P')):
+            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W)
+            pbar.set_postfix(loss=loss.item())
+            optimizer.zero_grad()
+            loss.backward(); optimizer.step()
 
-class DeformableRegistrationLoss(nn.Module):
-    def __init__(self, alpha=2, beta=2):
-        super(DeformableRegistrationLoss).__init__()
-        self.alpha = alpha; self.beta = beta
+        self.P.requires_grad = False
+    
+    def optimize_W(self):
+        ''' Solve for W using auto grad on self.loss '''
+        self.W.requires_grad = True
 
-    def forward(self, X, Y, sigma2, P, G, W):
-        '''
-        Inputs:
-            - X: (N,D=3).       Target point cloud 
-            - Y: (M,D).         Source gmm centroids
-            - sigma2: (M,).     Variance of each gmm centroid
-            - P: (M,N).         Soft cluster assignments
-            - G: (M,M).         Y after gaussian kernel
-            - W: (M,D).         Deformable transformation  \delta Y  = G @ W
-        '''
-        (N,D) = X.shape; (M,_) = Y.shape
+        lr = self.optim_config['W']['lr']; epochs = self.optim_config['W']['epochs']
+        optimizer = torch.optim.Adam([self.W], lr=lr)
+        for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing W')):
+            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W)
+            pbar.set_postfix(loss=loss.item(), normW=torch.norm(self.W).item())
+            optimizer.zero_grad()
+            loss.backward(); optimizer.step()
 
-        log_term = torch.log(sigma2)[:,None]                    # (M,1)
-        diff_term = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2 # (M,N)
-        diff_term /= 2 * log_term                               # (M,N)
+        self.W.requires_grad = False
+    
+    def optimize_PW(self):
+        self.P.requires_grad = True; self.W.requires_grad = True
 
-        loss = (log_term * D/2) + diff_term                     # (M,N)
-        pass
+        lr = self.optim_config['P']['lr']; epochs = self.optim_config['P']['epochs']
+        optimizer = torch.optim.Adam([self.P, self.W], lr=lr)
+        for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing PW')):
+            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W)
+            pbar.set_postfix(loss=loss.item(), lr=lr)
+            optimizer.zero_grad()
+            loss.backward(); optimizer.step()
+
+        self.P.requires_grad = False; self.W.requires_grad = False
+
+    
+    def optimize_sigma2(self):
+        ''' Solve for sigma2 using auto grad on self.loss '''
+        self.sigma2.requires_grad = True
+
+        lr = self.optim_config['sigma2']['lr']; epochs = self.optim_config['sigma2']['epochs']
+        optimizer = torch.optim.Adam([self.sigma2], lr=lr)
+        for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing sigma2')):
+            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W)
+            pbar.set_postfix(loss=loss.item())
+            optimizer.zero_grad()
+            loss.backward(); optimizer.step()
+
+        self.sigma2.requires_grad = False
