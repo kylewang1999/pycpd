@@ -2,8 +2,11 @@ from __future__ import division
 from math import log
 import numbers, numpy as np
 import torch, torch.nn as nn
-from pycpd.utility import *
 from tqdm import tqdm
+
+from pycpd.utility import *
+from pycpd.loss import DeformableRegistrationLoss
+from pycpd.mesh_gen import MeshGenerator
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -43,36 +46,7 @@ def np2torch(X, dtype=torch.float64):
 def torch2np(X):  
     return X.cpu().detach().numpy().squeeze() if isinstance(X, torch.Tensor) else X
 
-class DeformableRegistrationLoss(nn.Module):
-    def __init__(self):
-        super(DeformableRegistrationLoss, self).__init__()
 
-    def forward(self, X, Y, sigma2, P, G, W, alpha=1, beta=2):
-        '''
-        Inputs:
-            - X: (N,D=3).       Target point cloud 
-            - Y: (M,D).         Source gmm centroids
-            - sigma2: (M,).     Variance of each gmm centroid
-            - P: (M,N).         Soft cluster assignments
-            - G: (M,M).         Y after gaussian kernel
-            - W: (M,D).         Deformable transformation  \delta Y  = G @ W
-            - alpha: (scalar).  Regularization strength of CPD term
-            - beta: (scalar).   Regularization strength of other terms
-        '''
-        (N,D) = X.shape; (M,_) = Y.shape
-
-        log_term = torch.log(sigma2)[:,None]                    # (M,1)
-        diff_term = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2 # (M,N)
-        diff_term /= sigma2[:,None]                             # (M,N)
-        
-        gmm_loss = D * log_term + diff_term                     # (M,N)
-        gmm_loss = torch.sum(P * gmm_loss)               
-        
-        cpd_loss = torch.trace(W.T @ G @ W)                      
-
-        loss = gmm_loss + alpha * cpd_loss
-        return loss
-    
 class DeformableRegistrationTorch(object):
 
     def __init__(self, X, Y, P=None, sigma2=None, max_iterations=100, tolerance=1e-3, 
@@ -81,12 +55,11 @@ class DeformableRegistrationTorch(object):
         assert solver in ['em', 'torch'], f'Solver {solver} not supported. Expect \'em\' for Expectation-Maximization or \'torch\' for PyTorch autograd'
         self.solver = solver
         self.optim_config = {
-            'W': {'lr': 5e-5, 'epochs': 10000},
-            'P': {'lr': 1e-4, 'epochs': 1000},
-            'sigma2': {'lr': 1e-6, 'epochs': 1}
+            'W': {'lr': 5e-5, 'epochs': 1000},
         } if optim_config is None else optim_config
-
         self.device = DEVICE; 
+        self.mesh_generator = MeshGenerator(Y, method='knn')
+
         self.X = np2torch(X); self.Y = np2torch(Y); self.TY = np2torch(Y)
         self.alpha = alpha; self.beta = beta; self.w = w
         (self.N, self.D) = X.shape; (self.M, _) = Y.shape
@@ -235,7 +208,8 @@ class DeformableRegistrationTorch(object):
         lr = self.optim_config['W']['lr']; epochs = self.optim_config['W']['epochs']
         optimizer = torch.optim.Adam([self.W], lr=lr)
         for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing W')):
-            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W)
+            loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W, 
+                            edges=self.mesh_generator.edges)
             pbar.set_postfix(loss=loss.item(), normW=torch.norm(self.W).item())
             optimizer.zero_grad()
             loss.backward(); optimizer.step()
