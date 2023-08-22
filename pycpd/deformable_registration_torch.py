@@ -4,9 +4,12 @@ import numbers, numpy as np
 import torch, torch.nn as nn
 from tqdm import tqdm
 
-from pycpd.utility import *
-from pycpd.loss import DeformableRegistrationLoss
-from pycpd.mesh_gen import MeshGenerator
+try:
+    from pycpd.mesh_gen import MeshGenerator
+    from pycpd.utility import *
+except ImportError:
+    from pycpd.pycpd.mesh_gen import MeshGenerator
+    from pycpd.pycpd.utility import *
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -46,16 +49,60 @@ def np2torch(X, dtype=torch.float64):
 def torch2np(X):  
     return X.cpu().detach().numpy().squeeze() if isinstance(X, torch.Tensor) else X
 
+class DeformableRegistrationLoss(nn.Module):
+    ''' Implements loss function for deformable registration '''
+
+    def __init__(self, alpha=0, beta=2): 
+        '''
+            - alpha: (scalar).  Regularization strength of CPD term
+            - beta: (scalar).   Regularization strength of Geodesic term
+        '''
+        super(DeformableRegistrationLoss, self).__init__()
+        self.alpha = alpha; self.beta = beta
+        self.losses = {}
+
+    def forward(self, X, Y, sigma2, P, G, W, edges=None):
+        '''
+        Inputs:
+            - X: (N,D=3).       Target point cloud 
+            - Y: (M,D).         Source gmm centroids
+            - sigma2: (M,).     Variance of each gmm centroid
+            - P: (M,N).         Soft cluster assignments
+            - G: (M,M).         Y after gaussian kernel
+            - W: (M,D).         Deformable transformation  \delta Y  = G @ W
+
+        '''
+        (N,D) = X.shape; (M,_) = Y.shape
+
+        log_term = torch.log(sigma2)[:,None]                    # (M,1)
+        diff_term = torch.norm(Y[:,None,:] - X, dim=-1, p=2)**2 # (M,N)
+        diff_term /= sigma2[:,None]                             # (M,N)
+        
+        gmm_loss = D * log_term + diff_term                     # (M,N)
+        gmm_loss = torch.sum(P * gmm_loss)     
+
+        cpd_loss = torch.trace(W.T @ G @ W)                      
+
+        geo_loss = 0
+        if edges is not None:
+            geo_loss += torch.norm(Y[edges[...,0]] - Y[edges[...,1]], dim=-1, p=2).sum()
+            
+        loss = gmm_loss + self.alpha * cpd_loss + self.beta * geo_loss
+        self.losses['gmm_loss'] = gmm_loss.item()
+        self.losses['cpd_loss'] = cpd_loss.item()
+        self.losses['geo_loss'] = geo_loss.item()
+        
+        return loss
 
 class DeformableRegistrationTorch(object):
 
     def __init__(self, X, Y, P=None, sigma2=None, max_iterations=100, tolerance=1e-3, 
-        alpha=2, beta=2, w=0.0, solver='em', optim_config=None, *args, **kwargs):
+        alpha=2, beta=2, w=0.5, solver='em', optim_config=None, *args, **kwargs):
 
         assert solver in ['em', 'torch'], f'Solver {solver} not supported. Expect \'em\' for Expectation-Maximization or \'torch\' for PyTorch autograd'
         self.solver = solver
         self.optim_config = {
-            'W': {'lr': 5e-5, 'epochs': 1000},
+            'W': {'lr': 5e-5, 'epochs': 100},
         } if optim_config is None else optim_config
         self.device = DEVICE; 
         self.mesh_generator = MeshGenerator(Y, method='knn')
@@ -69,8 +116,13 @@ class DeformableRegistrationTorch(object):
         self.Np = 0; self.iteration = 0
 
         self.diff = torch.inf; self.q = torch.inf
-        if sigma2 is None: sigma2 = compute_sigma2(self.X, self.Y, self.P)
-        if not isinstance(sigma2, torch.Tensor): self.sigma2 = np2torch(sigma2)
+        if sigma2 is None: 
+            self.sigma2 = compute_sigma2(self.X, self.Y, self.P)
+        elif not isinstance(sigma2, torch.Tensor): 
+            self.sigma2 = np2torch(sigma2)
+        else: 
+            self.sigma2 = sigma2
+        
         self.P = torch.ones((self.M, self.N), device=self.device, requires_grad=False, dtype=torch.float64) if P is None else P
         self.Pt1 = torch.zeros((self.N, ), device=self.device, dtype=torch.float64, requires_grad=False)
         self.P1 = torch.zeros((self.M, ), device=self.device, dtype=torch.float64, requires_grad=False)
@@ -78,6 +130,7 @@ class DeformableRegistrationTorch(object):
         self.W = torch.zeros((self.M, self.D), device=self.device, dtype=torch.float64, requires_grad=False)
 
         self.loss = DeformableRegistrationLoss()
+        self.loss_val = None
     
     def init_state(self, iterations=3):
         ''' Used by torch solver only. Initialize P and W by running a few iterations of EM. '''
@@ -207,13 +260,14 @@ class DeformableRegistrationTorch(object):
 
         lr = self.optim_config['W']['lr']; epochs = self.optim_config['W']['epochs']
         optimizer = torch.optim.Adam([self.W], lr=lr)
-        for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing W')):
+        # for epoch in (pbar:=tqdm(range(epochs), desc='Optimizing W')):
+        for epoch in range(epochs):
             loss = self.loss(self.X, self.Y, self.sigma2, self.P, self.G, self.W, 
                             edges=self.mesh_generator.edges)
-            pbar.set_postfix(loss=loss.item(), normW=torch.norm(self.W).item())
             optimizer.zero_grad()
             loss.backward(); optimizer.step()
-
+            # pbar.set_postfix(loss=loss.item(), lr=lr)
+        self.loss_val = loss.item()
         self.W.requires_grad = False
     
     def optimize_PW(self):
@@ -226,6 +280,7 @@ class DeformableRegistrationTorch(object):
             pbar.set_postfix(loss=loss.item(), lr=lr)
             optimizer.zero_grad()
             loss.backward(); optimizer.step()
+        self.loss_val = loss.item()
 
         self.P.requires_grad = False; self.W.requires_grad = False
 
@@ -241,5 +296,6 @@ class DeformableRegistrationTorch(object):
             pbar.set_postfix(loss=loss.item())
             optimizer.zero_grad()
             loss.backward(); optimizer.step()
+        self.loss_val = loss.item()
 
         self.sigma2.requires_grad = False
